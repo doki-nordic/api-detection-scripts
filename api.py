@@ -1,6 +1,7 @@
 
 import os
 import sys
+import re
 import concurrent.futures
 import doxmlparser
 import doxmlparser.index as dox_index
@@ -56,10 +57,12 @@ class Group(Node):
 class Struct(Node):
     kind: str
     is_union: bool
+    fields: 'list[StructField]'
     def __init__(self, id: str, name: str, is_union: bool):
         super().__init__(id, name)
         self.is_union = is_union
         self.kind = 'union' if is_union else 'struct'
+        self.fields = []
 
 class Param:
     index: int
@@ -67,9 +70,7 @@ class Param:
     name: str
     desc: str
 
-class Function(Node):
-    kind: str = 'func'
-    return_type: str = 'void'
+class FunctionLike(Node):
     params: 'list[Param]'
     def __init__(self, id: str, name: str):
         super().__init__(id, name)
@@ -80,9 +81,45 @@ class Function(Node):
         self.params.append(param)
         return param
 
-nodes: 'list[Node]' = []
-nodes_by_id: 'dict(str, Node)' = {}
-nodes_by_short_id: 'dict(str, Node | list[Node])' = {}
+class Function(FunctionLike):
+    kind: str = 'func'
+    return_type: str = 'void'
+
+class Define(FunctionLike):
+    kind: str = 'def'
+    value: str = ''
+
+class EnumValue:
+    index: int
+    name: str
+    desc: str
+    value: str
+
+class Enum(Node):
+    kind: str = 'enum'
+    values: 'list[EnumValue]'
+    def __init__(self, id: str, name: str):
+        super().__init__(id, name)
+        self.values = []
+    def add_value(self):
+        value = EnumValue()
+        value.index = len(self.values)
+        self.values.append(value)
+        return value
+    
+class SimpleNode(Node):
+    type: str = ''
+
+class Typedef(SimpleNode):
+    kind: str = 'typedef'
+
+class Variable(SimpleNode):
+    kind: str = 'var'
+
+class StructField(SimpleNode):
+    kind: str = 'field'
+    index: int = 0
+
 
 
 def warning(*args, **kwargs):
@@ -134,7 +171,13 @@ def concurrent_pool_iter(func: Callable, iterable: Iterable, use_process: bool=F
     return zip(it, collected, range(len(collected)))
 
 
-def parse_location(node: Node, compound: 'dox_compound.compounddefType | dox_compound.memberdefType'):
+def parse_description(*args):
+    return '' # TODO: convert descriptions to string
+    # <briefdescription>
+    # <detaileddescription>
+    # <inbodydescription>
+
+def parse_location_description(node: Node, compound: 'dox_compound.compounddefType | dox_compound.memberdefType'):
     loc = compound.location
     if not loc:
         node.file = ''
@@ -151,16 +194,10 @@ def parse_location(node: Node, compound: 'dox_compound.compounddefType | dox_com
     else:
         node.file = ''
         node.line = None
+    node.desc = parse_description(compound)
 
 
-def parse_description(*args):
-    return '' # TODO: convert descriptions to string
-    # <briefdescription>
-    # <detaileddescription>
-    # <inbodydescription>
-
-
-def parse_type(type: 'dox_compound.linkedTextType | None') -> str:
+def parse_linked_text(type: 'dox_compound.linkedTextType | None') -> str:
     if not type:
         return 'void'
     result = ''
@@ -174,30 +211,63 @@ def parse_type(type: 'dox_compound.linkedTextType | None') -> str:
     return result
 
 
-def parse_function(memberdef: dox_compound.memberdefType) -> Function:
-    func = Function(memberdef.id, memberdef.name)
-    parse_location(func, memberdef)
-    func.desc = parse_description(memberdef)
+def parse_function_like(node: FunctionLike, memberdef: dox_compound.memberdefType):
+    parse_location_description(node, memberdef)
     for dox_param in memberdef.param:
         dox_param: dox_compound.paramType
-        param = func.add_param()
+        param = node.add_param()
         param.desc = parse_description(dox_param)
-        param.name = dox_param.declname
-        param.type = parse_type(dox_param.get_type())
-    func.return_type = parse_type(memberdef.get_type())
+        param.name = dox_param.declname or dox_param.defname
+        param.type = parse_linked_text(dox_param.get_type())
+
+def parse_function(memberdef: dox_compound.memberdefType) -> Function:
+    func = Function(memberdef.id, memberdef.name)
+    parse_function_like(func, memberdef)
+    func.return_type = parse_linked_text(memberdef.get_type())
     return func
+
+def parse_define(memberdef: dox_compound.memberdefType) -> Define:
+    define = Define(memberdef.id, memberdef.name)
+    parse_function_like(define, memberdef)
+    define.value = parse_linked_text(memberdef.initializer)
+    return define
+
+def parse_enum(memberdef: dox_compound.memberdefType, name_override: str=None) -> Enum:
+    enum = Enum(memberdef.id, name_override or memberdef.name)
+    parse_location_description(enum, memberdef)
+    for dox_value in memberdef.enumvalue:
+        dox_value: dox_compound.enumvalueType
+        enum_value = enum.add_value()
+        enum_value.desc = parse_description(dox_value)
+        enum_value.name = dox_value.name
+        enum_value.value = parse_linked_text(memberdef.initializer)
+    return enum
+
+def parse_simple_node(node: SimpleNode, memberdef: dox_compound.memberdefType) -> SimpleNode:
+    parse_location_description(node, memberdef)
+    node.type = parse_linked_text(memberdef.get_type()) + (memberdef.argsstring or '')
+    return node
 
 def parse_memberdef(memberdef: dox_compound.memberdefType) -> 'list[Node]':
     result: 'list[Node]' = []
     if memberdef.kind == dox_compound.DoxMemberKind.FUNCTION:
         result.append(parse_function(memberdef))
+    elif memberdef.kind == dox_compound.DoxMemberKind.DEFINE:
+        result.append(parse_define(memberdef))
+    elif memberdef.kind == dox_compound.DoxMemberKind.ENUM:
+        result.append(parse_enum(memberdef))
+    elif memberdef.kind == dox_compound.DoxMemberKind.TYPEDEF:
+        result.append(parse_simple_node(Typedef(memberdef.id, memberdef.name), memberdef))
+    elif memberdef.kind == dox_compound.DoxMemberKind.VARIABLE:
+        result.append(parse_simple_node(Variable(memberdef.id, memberdef.name), memberdef))
+    else:
+        warning(f'Unknown member kind "{memberdef.kind}".')
     return result
 
 
-def parse_file_or_group(node: 'File | Group', compound: dox_compound.compounddefType):
+def parse_file_or_group(node: 'File | Group', compound: dox_compound.compounddefType) -> 'list[Node]':
     result: 'list[Node]' = [node]
-    parse_location(node, compound)
-    node.desc = parse_description(compound)
+    parse_location_description(node, compound)
     for inner_ref in (compound.innerclass or []) + (compound.innergroup or []):
         inner_ref: dox_compound.refType
         node.add_child(inner_ref.refid)
@@ -226,11 +296,53 @@ def parse_group(compound: dox_compound.compounddefType) -> 'list[Node]':
     return parse_file_or_group(group, compound)
 
 
+def parse_field_with_macro(memberdef: dox_compound.memberdefType) -> StructField:
+    field = StructField(memberdef.id, memberdef.name)
+    parse_location_description(field, memberdef)
+    argsstring: str = (memberdef.argsstring or '')
+    regex = r'^\s*\(\s*([a-z_0-9]+)(?:\(.*?\)|.)*?\)(?:\s*([A-Z_0-9]+)\s*$)?'
+    matches = re.search(regex, argsstring, re.IGNORECASE | re.DOTALL)
+    field.type = parse_linked_text(memberdef.get_type())
+    if matches:
+        if len(field.type):
+            field.type += ' '
+        field.type += field.name
+        if matches.group(2):
+            field.type += (argsstring[:matches.start(2)].strip() + argsstring[matches.end(2):].strip()).strip()
+            field.name = matches.group(2)
+        else:
+            field.type += (argsstring[:matches.start(1)].strip() + argsstring[matches.end(1):].strip()).strip()
+            field.name = matches.group(1)
+    else:
+        field.type = parse_linked_text(memberdef.get_type()) + argsstring
+    return field
+
 def parse_struct(compound: dox_compound.compounddefType, is_union: bool) -> 'list[Node]':
+    result: 'list[Node]' = []
     struct = Struct(compound.id, compound.compoundname, is_union)
-    parse_location(struct, compound)
-    struct.desc = parse_description(compound)
-    return struct
+    parse_location_description(struct, compound)
+    for sectiondef in compound.sectiondef or []:
+        sectiondef: dox_compound.sectiondefType
+        for memberdef in sectiondef.memberdef or []:
+            memberdef: dox_compound.memberdefType
+            if memberdef.kind == dox_compound.DoxMemberKind.VARIABLE:
+                field: StructField = parse_simple_node(StructField(memberdef.id, memberdef.name), memberdef)
+                field.index = len(struct.fields)
+                struct.fields.append(field)
+            elif memberdef.kind == dox_compound.DoxMemberKind.FUNCTION:
+                field = parse_field_with_macro(memberdef)
+                field.index = len(struct.fields)
+                struct.fields.append(field)
+            elif memberdef.kind == dox_compound.DoxMemberKind.ENUM:
+                full_name = memberdef.qualifiedname
+                if not memberdef.name:
+                    full_name += '::' + memberdef.id
+                enum = parse_enum(memberdef, full_name)
+                result.append(enum)
+            else:
+                warning(f'Unknown structure member kind "{memberdef.kind}", name {memberdef.name} in {struct.name}, {struct.file}:{struct.line}')
+    result.append(struct)
+    return result
 
 
 def process_compound(id: str) -> 'list[Node]':
@@ -238,19 +350,29 @@ def process_compound(id: str) -> 'list[Node]':
     for compound in dox_compound.parse(XML_DIR / (id + '.xml'), True, True).get_compounddef():
         compound: dox_compound.compounddefType
         if compound.kind == dox_index.CompoundKind.FILE:
-            result.append(parse_file(compound))
+            result.extend(parse_file(compound))
         elif compound.kind == dox_index.CompoundKind.GROUP:
-            result.append(parse_group(compound))
+            result.extend(parse_group(compound))
         elif compound.kind in (dox_index.CompoundKind.STRUCT,
                                dox_index.CompoundKind.CLASS,
                                dox_index.CompoundKind.UNION):
-            result.append(parse_struct(compound, (compound.kind == dox_index.CompoundKind.UNION)))
+            result.extend(parse_struct(compound, (compound.kind == dox_index.CompoundKind.UNION)))
         else:
             warning(f'Unexpected doxygen compound kind: "{compound.kind}"')
     return result
 
+class ParseResult:
+    nodes: 'list[Node]'
+    nodes_by_id: 'dict(str, Node)'
+    nodes_by_short_id: 'dict(str, Node | list[Node])'
+    def __init__(self):
+        self.nodes = []
+        self.nodes_by_id = {}
+        self.nodes_by_short_id = {}
 
-def parse_all(dir: Path):
+
+def parse_doxygen_xml(dir: Path) -> ParseResult:
+    result = ParseResult()
     index = dox_index.parse(dir / 'index.xml', True, True)
     ids: 'list[str]' = []
     for compound in index.get_compound():
@@ -271,15 +393,22 @@ def parse_all(dir: Path):
     shuffle(ids)
     #ids = ids[0:100]
     for node, _, _ in concurrent_pool_iter(process_compound, ids, True, 20):
-        nodes.extend(node)
+        result.nodes.extend(node)
+    return result
 
 
 if __name__ == '__main__':
-    parse_all(XML_DIR)
+    res = parse_doxygen_xml(XML_DIR)
     class MyEncoder(JSONEncoder):
         def default(self, o):
             if isinstance(o, set):
                 return list(o)
             else:
-                return o.__dict__
-    print(MyEncoder(indent=4).encode(nodes))
+                d = {}
+                for name in tuple(dir(o)):
+                    if not name.startswith('_'):
+                        value = getattr(o, name)
+                        if not callable(value):
+                            d[name] = value
+                return d
+    print(MyEncoder(sort_keys=False, indent=4).encode(res.nodes))
